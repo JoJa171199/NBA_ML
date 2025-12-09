@@ -35,7 +35,7 @@ class PredictionRequest(BaseModel):
     opponent: str
     is_home: bool = True
 
-# --- 3. MOCK DATA BASE (Tus promedios base) ---
+# --- 3. MOCK DATA BASE ---
 PLAYER_BASE_STATS = {
     "LeBron James":  {"avg_pts": 25.4, "avg_ast": 8.1, "avg_reb": 7.3, "avg_blk": 0.6, "avg_stl": 1.1, "momentum": 1.05},
     "Stephen Curry": {"avg_pts": 28.1, "avg_ast": 5.0, "avg_reb": 4.4, "avg_blk": 0.3, "avg_stl": 0.8, "momentum": 0.98},
@@ -52,43 +52,37 @@ OPPONENT_STATS = {
     "DEFAULT": {"def_rating": 112.0, "pace": 99.0}
 }
 
-# --- 4. FUNCIÓN GENERADORA DE VARIABLES (Feature Engineering Simulado) ---
-def generate_features_for_model(stat_type, player_base, opp_stats, is_home):
+# --- 4. ENGINE DE VARIABLES ---
+def generate_features_dict(stat_type, player_base, opp_stats, is_home):
     """
-    Esta función traduce los datos básicos a las columnas complejas que pide el modelo.
-    Basado en los logs: H2H_AVG_X, L10_X, IS_B2B, IS_HOME, L10_STD_X
+    Genera un diccionario con TODAS las posibles variables que el modelo podría pedir.
+    Nombres en MAYÚSCULAS para coincidir con el entrenamiento.
     """
-    # Determinamos la estadística base (pts, ast, etc)
     base_val = player_base.get(f"avg_{stat_type}", 0)
-    
-    # Factor de impulso para simular "Last 10 Games" (L10)
     momentum = player_base.get("momentum", 1.0)
     l10_val = base_val * momentum
+    suffix = stat_type.upper() # PTS, AST...
     
-    # Diccionario con las columnas EXACTAS que piden tus logs
-    # NOMBRES DE COLUMNAS DEBEN SER MAYÚSCULAS según tus logs (H2H_AVG_PTS)
-    suffix = stat_type.upper() # PTS, AST, REB...
-    
+    # Diccionario maestro de variables disponibles
     features = {
-        # Variables de tiempo/lugar
         "IS_HOME": 1 if is_home else 0,
-        "IS_B2B": 0,  # Asumimos que no es Back-to-Back para el MVP
-        "REST_DAYS": 1, # Descanso estándar
-        
-        # Variables del Oponente
+        "IS_B2B": 0,
+        "REST_DAYS": 1,
         "OPP_DEF_RATING": opp_stats["def_rating"],
         "PACE": opp_stats["pace"],
-        "OPP_TEAM": 0, # Placeholder numérico si el modelo usó LabelEncoder, riesgo menor
         
-        # Variables Específicas de la Estadística (L10, H2H, STD)
+        # Variables dinámicas por tipo
         f"L10_{suffix}": l10_val,
-        f"L10_STD_{suffix}": base_val * 0.25, # Simulamos desviación estándar del 25%
-        f"H2H_AVG_{suffix}": base_val,        # Asumimos promedio histórico similar al actual
-        f"AVG_{suffix}": base_val,            # A veces piden el promedio simple
+        f"L10_STD_{suffix}": base_val * 0.25,
+        f"H2H_AVG_{suffix}": base_val,
+        f"AVG_{suffix}": base_val,
+        
+        # A veces el modelo pide las de otros tipos (cross-features)
+        "AVG_PTS": player_base.get("avg_pts", 0),
+        "AVG_AST": player_base.get("avg_ast", 0),
+        "AVG_REB": player_base.get("avg_reb", 0),
     }
-    
-    # Crear DataFrame de una fila
-    return pd.DataFrame([features])
+    return features
 
 # --- 5. ENDPOINT ---
 @app.post("/predict_all")
@@ -100,49 +94,49 @@ def predict_performance(request: PredictionRequest):
     
     for stat, obj in loaded_objects.items():
         try:
-            # 1. Extraer el modelo real del diccionario
+            # 1. Recuperar Modelo y Lista de Features
             if isinstance(obj, dict):
                 model = obj.get('model')
-                # Si tienes la lista de features guardada, úsala para filtrar
-                expected_features = obj.get('features', []) 
+                # LA CLAVE DEL ÉXITO: Usar la lista 'features' guardada en el pickle
+                required_columns = obj.get('features') 
             else:
                 model = obj
-                expected_features = []
+                required_columns = getattr(model, "feature_names_in_", None)
 
             if not model:
                 predictions[stat] = -1
                 continue
 
-            # 2. Generar DataFrame con nombres correctos
-            input_df = generate_features_for_model(stat, player_stats, opp_stats, request.is_home)
+            # 2. Generar nuestros datos disponibles
+            available_data = generate_features_dict(stat, player_stats, opp_stats, request.is_home)
             
-            # 3. CRÍTICO: Asegurar que el DataFrame tenga SOLO las columnas que el modelo quiere
-            # Si guardaste la lista de features en el pickle, filtramos:
-            if hasattr(model, "feature_names_in_"):
-                # Scikit-learn moderno guarda esto
-                cols_needed = model.feature_names_in_
-            elif expected_features:
-                cols_needed = expected_features
+            # 3. ALINEACIÓN FORZADA (Force Align)
+            if required_columns is not None:
+                # Creamos el DataFrame usando LA LISTA DEL MODELO como columnas
+                # Esto garantiza el orden perfecto.
+                input_df = pd.DataFrame(columns=required_columns)
+                input_df.loc[0] = 0.0 # Inicializamos todo a 0 (relleno de seguridad)
+                
+                # Rellenamos solo lo que tenemos
+                for col in required_columns:
+                    if col in available_data:
+                        input_df.at[0, col] = available_data[col]
+                    else:
+                        # Si falta una columna, se queda en 0.0
+                        pass
             else:
-                # Si no sabemos, mandamos todo lo que generamos (arriesgado pero mejor que nada)
-                cols_needed = input_df.columns
-            
-            # Reordenar y rellenar columnas faltantes con 0
-            final_input = pd.DataFrame()
-            for col in cols_needed:
-                if col in input_df.columns:
-                    final_input[col] = input_df[col]
-                else:
-                    final_input[col] = 0.0 # Relleno de emergencia para columnas no calculadas
-            
+                # Fallback por si no encontramos la lista (esperemos que no pase)
+                input_df = pd.DataFrame([available_data])
+
             # 4. Predecir
-            pred_val = model.predict(final_input)
+            pred_val = model.predict(input_df)
             val = float(pred_val[0]) if isinstance(pred_val[0], (np.float64, float)) else float(pred_val[0][0])
             predictions[stat] = round(val, 1)
             
         except Exception as e:
+            # Imprimimos el error pero no rompemos el loop
             print(f"🔥 Error en {stat}: {e}")
-            predictions[stat] = -999 # Código de error para UI
+            predictions[stat] = -999
 
     return {
         "player": request.player_name,
