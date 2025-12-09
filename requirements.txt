@@ -2,6 +2,7 @@
 uvicorn
 pandas
 numpy
-scikit-learn==1.6.1  <-- ¡CRÍTICO! Pon la misma versión que usaste en Colab
+scikit-learn==1.6.1
 
 joblib
+
